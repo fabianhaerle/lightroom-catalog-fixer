@@ -5,7 +5,7 @@ __pycache__/
 
 # Example data and generated fixed catalogs (large binary test data)
 example-data/
-fixed-catalog/
+fixed*
 *.lrcat
 *.lrcat.backup-*
 *.lrdata

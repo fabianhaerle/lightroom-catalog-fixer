@@ -564,20 +564,31 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
     new_name = os.path.basename(new_path)
 
     # --- resolve / create root folder ---------------------------------------
-    # Find the longest matching existing root folder prefix.
+    # Prefer an existing root folder whose absolutePath is a prefix of the
+    # new directory. Among matches, prefer the one that yields the SHORTEST
+    # relative path (i.e. the closest root), and skip roots that would make
+    # the relative path climb above the root (e.g. a root pointing at a
+    # subfolder of the target). Only create a new volume-root folder when no
+    # existing root can represent the target directory.
     root_row = conn.execute(
         "SELECT id_local, absolutePath FROM AgLibraryRootFolder"
     ).fetchall()
-    root_row.sort(key=lambda r: len(r[1] or ""), reverse=True)
 
-    root_id: Optional[int] = None
-    root_prefix = ""
+    candidates: List[Tuple[int, str, str]] = []  # (id, norm_path, rel)
     for rid, rpath in root_row:
         rp = os.path.normpath(rpath or "")
-        if new_dir.lower().startswith(rp.lower()) and rp not in ("", os.sep):
-            root_id, root_prefix = rid, rp
-            break
-    if root_id is None:
+        if not rp or rp == os.sep:
+            continue
+        if new_dir.lower().startswith(rp.lower()):
+            rel = os.path.relpath(new_dir, rp)
+            if rel.startswith(".."):
+                continue
+            candidates.append((rid, rp, rel.replace(os.sep, "/")))
+    if candidates:
+        # Closest root = shortest relative path
+        candidates.sort(key=lambda c: len(c[2]))
+        root_id, root_prefix, rel_from_root = candidates[0]
+    else:
         # No existing root folder matches: create one at the volume root
         # (Lightroom convention: root folders represent volumes/drives).
         drive, _ = os.path.splitdrive(new_dir)
@@ -591,15 +602,14 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
             "VALUES (?, ?, ?, ?, ?)",
             (root_id, _new_uuid(), root_prefix, root_prefix, None),
         )
+        rel_from_root = os.path.relpath(new_dir, root_prefix).replace(os.sep, "/")
+        if rel_from_root == ".":
+            rel_from_root = ""
 
     # --- resolve / create folder row ----------------------------------------
-    rel_from_root = os.path.relpath(new_dir, root_prefix)
-    if rel_from_root == ".":
-        rel_from_root = ""
-
     folder_row = conn.execute(
         "SELECT id_local FROM AgLibraryFolder WHERE rootFolder = ? AND pathFromRoot = ?",
-        (root_id, rel_from_root.replace(os.sep, "/")),
+        (root_id, rel_from_root),
     ).fetchone()
     if folder_row:
         folder_id = folder_row[0]
@@ -611,7 +621,7 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
         conn.execute(
             "INSERT INTO AgLibraryFolder (id_local, id_global, pathFromRoot, rootFolder) "
             "VALUES (?, ?, ?, ?)",
-            (folder_id, _new_uuid(), rel_from_root.replace(os.sep, "/"), root_id),
+            (folder_id, _new_uuid(), rel_from_root, root_id),
         )
 
     # --- resolve / create file row ------------------------------------------
