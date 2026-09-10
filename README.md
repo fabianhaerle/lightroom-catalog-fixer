@@ -78,9 +78,24 @@ usage: fix_missing_photos.py [-h] [--apply] [--no-dry-run]
 | `--min-score N` | Minimum match score for a confident fix (default: `60`) |
 | `--no-backup` | Skip the automatic catalog backup before writing |
 | `--verbose` / `-v` | Also list candidate files for ambiguous matches |
+| `--log-dir DIR` | Directory for the run log file (default: next to the catalog) |
 
 Exit codes: `0` success, `1` runtime/write error, `2` usage error (bad
 catalog path, no search paths).
+
+### Run log
+
+Every run writes a log file with a `yy-mm-dd-hh-mm-ss` prefix, created next
+to the catalog by default (override with `--log-dir`):
+
+```text
+26-09-10-21-47-40_fix_missing_photos.log
+```
+
+The log mirrors everything printed to the console — run header (start time,
+catalog path, search paths), the full missing-photos report, and the apply
+result — so each run leaves a self-contained audit trail. The log is written
+even in dry-run mode.
 
 ### Example output (dry run)
 
@@ -303,6 +318,9 @@ want more aggressive proposals (they will be listed as *ambiguous* first).
   `--no-backup`).
 - **Single transaction.** All updates are applied atomically; any error
   rolls back the whole batch.
+- **Run log.** Every run writes a timestamped log file
+  (`yy-mm-dd-hh-mm-ss_fix_missing_photos.log`) mirroring the console
+  output, giving you an audit trail of what was found and changed.
 - **Close Lightroom first.** Lightroom caches catalog state in memory; if
   it is running while the catalog is modified, changes can be lost or the
   catalog corrupted.
@@ -367,4 +385,4 @@ debugging.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE].

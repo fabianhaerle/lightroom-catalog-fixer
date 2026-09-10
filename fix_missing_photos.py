@@ -676,6 +676,61 @@ def apply_fixes(catalog_path: str, fixes: Sequence[MatchResult],
 
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
+class RunLogger:
+    """
+    Tees all console output into a timestamped log file.
+
+    The log file is created next to the catalog (or in the current working
+    directory if that fails) with a ``yy-mm-dd-hh-mm-ss`` prefix, e.g.::
+
+        26-09-10-21-34-26_fix_missing_photos.log
+
+    Every line printed through :meth:`print` (or written directly to
+    stdout/stderr by this script) is mirrored into the file.
+    """
+
+    def __init__(self, log_dir: Optional[str] = None) -> None:
+        stamp = _dt.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
+        name = f"{stamp}_fix_missing_photos.log"
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, name)
+        else:
+            path = name
+        self.path = path
+        self._file = open(path, "a", encoding="utf-8")
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = _Tee(self._orig_stdout, self._file)
+        sys.stderr = _Tee(self._orig_stderr, self._file)
+
+    def close(self) -> None:
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        self._file.close()
+
+
+class _Tee:
+    """File-like object that writes to two streams."""
+
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self._streams:
+            s.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            s.flush()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -700,6 +755,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Do not create a backup before modifying the catalog")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show candidate details for every missing photo")
+    parser.add_argument("--log-dir", default=None,
+                        help="Directory for the run log file (default: next to "
+                             "the catalog; falls back to the current directory)")
     return parser
 
 
@@ -723,6 +781,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not search_paths:
         print("error: at least one search path is required", file=sys.stderr)
         return 2
+
+    # --- start run log -------------------------------------------------------
+    # Log next to the catalog by default; fall back to the current directory.
+    log_dir = args.log_dir or os.path.dirname(catalog_path)
+    try:
+        logger = RunLogger(log_dir)
+    except OSError:
+        logger = RunLogger(".")  # fall back to cwd
+    main._active_logger = logger  # type: ignore[attr-defined]
+    print(f"Run started {_dt.datetime.now().isoformat(timespec='seconds')}")
+    print(f"Catalog:  {catalog_path}")
+    print(f"Search:   {', '.join(search_paths)}")
+    print(f"Log file: {os.path.abspath(logger.path)}")
+    print()
 
     # --- load catalog --------------------------------------------------------
     try:
@@ -846,5 +918,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+def run(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point that guarantees the run log is closed on exit."""
+    try:
+        return main(argv)
+    finally:
+        logger = getattr(main, "_active_logger", None)
+        if logger is not None:
+            logger.close()
+            main._active_logger = None  # type: ignore[attr-defined]
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
