@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Example data and generated fixed catalogs (large binary test data)
+example-data/
+fixed-catalog/
+*.lrcat
+*.lrcat.backup-*
+*.lrdata
+*.lrcat-data/
+
 # C extensions
 *.so
 
