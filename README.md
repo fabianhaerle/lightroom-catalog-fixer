@@ -65,7 +65,7 @@ python fix_missing_photos.py Catalog.lrcat D:\RecoveredPhotos --no-dry-run
 ```text
 usage: fix_missing_photos.py [-h] [--apply] [--no-dry-run]
                              [--min-score MIN_SCORE] [--no-backup]
-                             [--verbose]
+                             [--verbose] [--no-progress]
                              catalog [search_paths ...]
 ```
 
@@ -78,10 +78,28 @@ usage: fix_missing_photos.py [-h] [--apply] [--no-dry-run]
 | `--min-score N` | Minimum match score for a confident fix (default: `60`) |
 | `--no-backup` | Skip the automatic catalog backup before writing |
 | `--verbose` / `-v` | Also list candidate files for ambiguous matches |
+| `--no-progress` | Disable the progress bar (useful when output is piped or redirected) |
 | `--log-dir DIR` | Directory for the run log file (default: next to the catalog) |
 
 Exit codes: `0` success, `1` runtime/write error, `2` usage error (bad
 catalog path, no search paths).
+
+### Progress display
+
+Scanning large photo collections can take a while, so the script shows a
+live progress bar in the console during its three slow phases — checking
+the catalog paths, scanning the search paths, and matching. The bar shows
+the phase, a percentage, the item count, and the **file currently being
+processed**:
+
+```text
+Scanning [====================>                       ]  41%  8,214/20,043 files  D:\RecoveredPhotos\2024\03\DSCF0354.RAF
+```
+
+The line is redrawn in place, so it does not clutter the console, and it is
+**not** written to the run log (the log only contains the final counts).
+Pass `--no-progress` if you pipe or redirect the output; in that case a
+short status line is printed at every 10 % milestone instead.
 
 ### Run log
 

@@ -39,6 +39,7 @@ import shutil
 import sqlite3
 import struct
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -483,15 +484,34 @@ class DiskIndex:
     time.
     """
 
-    def __init__(self, search_paths: Sequence[str], read_sidecars: bool = True):
+    def __init__(self, search_paths: Sequence[str], read_sidecars: bool = True,
+                 progress: Optional[ProgressReporter] = None):
         self.by_name: Dict[str, List[CandidateFile]] = {}
         self.by_base: Dict[str, List[CandidateFile]] = {}
         self.by_original_name: Dict[str, List[CandidateFile]] = {}
         self.by_capture_time: Dict[_dt.datetime, List[CandidateFile]] = {}
         self.sidecars_read = 0
-        self._scan(search_paths, read_sidecars)
+        self._scan(search_paths, read_sidecars, progress)
 
-    def _scan(self, search_paths: Sequence[str], read_sidecars: bool) -> None:
+    def _scan(self, search_paths: Sequence[str], read_sidecars: bool,
+              progress: Optional[ProgressReporter] = None) -> None:
+        # First pass: count candidate files so the progress bar has a total.
+        # Cheap (directory listing only); the walk is repeated below.
+        file_count = 0
+        for root_dir in search_paths:
+            if not os.path.isdir(root_dir):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root_dir):
+                dirnames[:] = [d for d in dirnames
+                               if not d.startswith(".") and d != "Lightroom Catalog Previews.lrdata"]
+                file_count += sum(
+                    1 for f in filenames
+                    if os.path.splitext(f)[1].lower() in KNOWN_EXTENSIONS)
+
+        if progress is not None:
+            progress.start("Scanning", file_count, unit="files")
+
+        indexed = 0
         for root_dir in search_paths:
             if not os.path.isdir(root_dir):
                 print(f"warning: search path does not exist: {root_dir}",
@@ -506,6 +526,8 @@ class DiskIndex:
                     if ext not in KNOWN_EXTENSIONS:
                         continue
                     full = os.path.join(dirpath, fname)
+                    if progress is not None:
+                        progress.update(current=full)
                     try:
                         st = os.stat(full)
                     except OSError:
@@ -532,6 +554,15 @@ class DiskIndex:
                             cand.source = "exif"
                             self.by_capture_time.setdefault(
                                 cand.capture_time, []).append(cand)
+
+                    indexed += 1
+                    if progress is not None:
+                        progress.update(1, current=full)
+
+        if progress is not None:
+            # No summary message here: main() prints the indexed-file count
+            # after the scan, and finish() only clears the bar line.
+            progress.finish()
 
     def _read_sidecar(self, cand: CandidateFile) -> None:
         base, _ = os.path.splitext(cand.path)
@@ -718,14 +749,22 @@ def find_candidates(photo: CatalogPhoto, index: DiskIndex) -> List[CandidateFile
 # ---------------------------------------------------------------------------
 
 
-def check_existence(photos: List[CatalogPhoto]) -> Tuple[List[CatalogPhoto], List[CatalogPhoto]]:
+def check_existence(photos: List[CatalogPhoto],
+                    progress: Optional[ProgressReporter] = None
+                    ) -> Tuple[List[CatalogPhoto], List[CatalogPhoto]]:
     """Split photos into (existing, missing) based on the reconstructed path."""
     existing: List[CatalogPhoto] = []
     missing: List[CatalogPhoto] = []
+    if progress is not None:
+        progress.start("Checking", len(photos), unit="photos")
     for photo in photos:
         photo.old_absolute_path = compute_absolute_path(photo)
         photo.exists_on_disk = bool(photo.old_absolute_path and os.path.isfile(photo.old_absolute_path))
+        if progress is not None:
+            progress.update(1, current=photo.old_absolute_path or photo.filename)
         (existing if photo.exists_on_disk else missing).append(photo)
+    if progress is not None:
+        progress.finish()
     return existing, missing
 
 
@@ -862,7 +901,8 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
 
 
 def apply_fixes(catalog_path: str, fixes: Sequence[MatchResult],
-                backup: bool = True) -> int:
+                backup: bool = True,
+                progress: Optional[ProgressReporter] = None) -> int:
     """Write the re-link updates to the catalog. Returns number of fixes applied."""
     if not fixes:
         return 0
@@ -876,10 +916,16 @@ def apply_fixes(catalog_path: str, fixes: Sequence[MatchResult],
     applied = 0
     try:
         conn.execute("BEGIN")
+        if progress is not None:
+            progress.start("Writing", len(fixes), unit="fixes")
         for fix in fixes:
             assert fix.candidate is not None
             update_catalog_file_location(conn, fix.photo, fix.candidate.path)
+            if progress is not None:
+                progress.update(1, current=fix.photo.filename)
             applied += 1
+        if progress is not None:
+            progress.finish()
         conn.commit()
     except Exception:
         conn.rollback()
@@ -919,6 +965,9 @@ class RunLogger:
         self._file = open(path, "a", encoding="utf-8")
         self._orig_stdout = sys.stdout
         self._orig_stderr = sys.stderr
+        # Direct handle to the real console, bypassing the tee. Progress bars
+        # use it so the log file is not flooded with redrawn lines.
+        self.console = self._orig_stdout
         sys.stdout = _Tee(self._orig_stdout, self._file)
         sys.stderr = _Tee(self._orig_stderr, self._file)
 
@@ -942,6 +991,105 @@ class _Tee:
     def flush(self) -> None:
         for s in self._streams:
             s.flush()
+
+
+# ---------------------------------------------------------------------------
+# Progress display
+# ---------------------------------------------------------------------------
+
+
+class ProgressReporter:
+    """
+    Single-line progress display for the console.
+
+    Shows the current file and a percentage bar, e.g.::
+
+        Scanning  [=====>          ]  34%  1,234 files  D:\\Photos\\IMG_0123.CR2
+
+    The line is redrawn in place with carriage returns. Output goes directly
+    to the console (not through the run-log tee), so the log file stays
+    clean. Falls back to periodic one-line status prints when the console is
+    not a terminal (e.g. output is piped or redirected).
+    """
+
+    def __init__(self, console=None, enabled: bool = True,
+                 width: int = 60, min_interval: float = 0.1) -> None:
+        self._console = console if console is not None else sys.stdout
+        self._enabled = enabled
+        self._width = width
+        self._min_interval = min_interval
+        self._last_draw = 0.0
+        self._active = False
+        self._is_tty = False
+        try:
+            self._is_tty = self._console.isatty()
+        except AttributeError:
+            self._is_tty = False
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self, label: str, total: int, unit: str = "items") -> None:
+        """Begin a new progress run with ``total`` items."""
+        self._label = label
+        self._total = max(1, total)
+        self._count = 0
+        self._unit = unit
+        self._current = ""
+        self._last_draw = 0.0
+        self._active = True
+        if self._enabled:
+            self._draw(force=True)
+
+    def update(self, count: int = 1, current: str = "") -> None:
+        """Advance the counter and optionally set the current item label."""
+        if not self._active:
+            return
+        self._count += count
+        if current:
+            self._current = current
+        if self._enabled:
+            self._draw()
+
+    def finish(self, message: str = "") -> None:
+        """End the progress run, clearing the bar (or printing a summary)."""
+        if not self._active:
+            return
+        self._active = False
+        if not self._enabled:
+            return
+        if self._is_tty:
+            # Erase the progress line completely.
+            self._console.write("\r" + " " * (self._width + 80) + "\r")
+        elif message:
+            self._console.write(message + "\n")
+        self._console.flush()
+
+    # -- rendering ----------------------------------------------------------
+
+    def _draw(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_draw) < self._min_interval:
+            return
+        self._last_draw = now
+
+        pct = min(100, int(self._count * 100 / self._total))
+        filled = int(self._width * self._count / self._total)
+        bar = "=" * filled + ">" + " " * max(0, self._width - filled - 1)
+        line = (f"{self._label} [{bar}] {pct:3d}%  "
+                f"{self._count:,}/{self._total:,} {self._unit}  {self._current}")
+
+        if self._is_tty:
+            self._console.write("\r" + line[: self._width + 120])
+            self._console.flush()
+        else:
+            # Not a terminal: print a status line at every 10% milestone so
+            # piped output still shows progress without flooding the log.
+            if pct >= self._next_milestone():
+                self._console.write(f"{self._label}: {pct:3d}%  "
+                                    f"{self._current}\n")
+
+    def _next_milestone(self) -> int:
+        return (self._count * 100 // self._total // 10 + 1) * 10
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +1117,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Do not create a backup before modifying the catalog")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show candidate details for every missing photo")
+    parser.add_argument("--no-progress", dest="no_progress", action="store_true",
+                        help="Disable the progress bar (useful when output is "
+                             "piped or redirected)")
     parser.add_argument("--log-dir", default=None,
                         help="Directory for the run log file (default: next to "
                              "the catalog; falls back to the current directory)")
@@ -1004,6 +1155,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except OSError:
         logger = RunLogger(".")  # fall back to cwd
     main._active_logger = logger  # type: ignore[attr-defined]
+    # Progress bar writes directly to the real console, bypassing the log tee.
+    progress = ProgressReporter(console=logger.console,
+                                enabled=not args.no_progress)
     print(f"Run started {_dt.datetime.now().isoformat(timespec='seconds')}")
     print(f"Catalog:  {catalog_path}")
     print(f"Search:   {', '.join(search_paths)}")
@@ -1024,7 +1178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Loaded {len(photos)} photos from catalog.")
 
     # --- classify ------------------------------------------------------------
-    existing, missing = check_existence(photos)
+    existing, missing = check_existence(photos, progress=progress)
     print(f"  {len(existing)} photos found on disk at their catalog location.")
     print(f"  {len(missing)} photos are MISSING from their catalog location.")
 
@@ -1034,13 +1188,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- scan disk -----------------------------------------------------------
     print(f"Scanning {len(search_paths)} search path(s) ...")
-    index = DiskIndex(search_paths)
+    index = DiskIndex(search_paths, progress=progress)
     total_indexed = sum(len(v) for v in index.by_name.values())
     print(f"  indexed {total_indexed} image files.")
 
     # --- match ---------------------------------------------------------------
     results: List[MatchResult] = []
+    progress.start("Matching", len(missing), unit="photos")
     for photo in missing:
+        progress.update(1, current=photo.filename)
         candidates = find_candidates(photo, index)
         photo.candidates = candidates
         best = candidates[0] if candidates else None
@@ -1070,6 +1226,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             status = "no_match"
             results.append(MatchResult(photo=photo, status="no_match"))
+    progress.finish()
 
     fixable = [r for r in results if r.status == "fixed"]
     ambiguous = [r for r in results if r.status == "ambiguous"]
@@ -1134,7 +1291,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     try:
-        applied = apply_fixes(catalog_path, fixable, backup=not args.no_backup)
+        applied = apply_fixes(catalog_path, fixable, backup=not args.no_backup,
+                              progress=progress)
     except sqlite3.Error as exc:
         print(f"error: failed to update catalog: {exc}", file=sys.stderr)
         return 1
