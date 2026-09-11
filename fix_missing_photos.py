@@ -823,21 +823,39 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
     else:
         # Reuse the existing file row: update folder + name
         if photo.file_id is not None:
-            conn.execute(
-                "UPDATE AgLibraryFile SET folder = ?, idx_filename = ? WHERE id_local = ?",
-                (folder_id, new_name, photo.file_id),
-            )
+            stem, ext = os.path.splitext(new_name)
+            try:
+                conn.execute(
+                    "UPDATE AgLibraryFile SET folder = ?, idx_filename = ?, "
+                    "baseName = ?, extension = ?, lc_idx_filename = ?, "
+                    "lc_idx_filenameExtension = ? WHERE id_local = ?",
+                    (folder_id, new_name, stem, ext.lstrip("."),
+                     new_name.lower(), ext.lstrip(".").lower(), photo.file_id),
+                )
+            except sqlite3.OperationalError:
+                # Older catalogs may lack the baseName/extension/lc_* columns;
+                # fall back to updating the file name only.
+                conn.execute(
+                    "UPDATE AgLibraryFile SET folder = ?, idx_filename = ? "
+                    "WHERE id_local = ?",
+                    (folder_id, new_name, photo.file_id),
+                )
             file_id = photo.file_id
         else:
             max_id = conn.execute(
                 "SELECT COALESCE(MAX(id_local), 0) FROM AgLibraryFile"
             ).fetchone()[0]
             file_id = max_id + 1
+            stem, ext = os.path.splitext(new_name)
             conn.execute(
-                "INSERT INTO AgLibraryFile (id_local, id_global, folder, idx_filename, originalFilename, modTime, modTimeNS, legacyImage, fileSize) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (file_id, _new_uuid(), folder_id, new_name, new_name,
-                 int(os.path.getmtime(new_path)), None, 0, os.path.getsize(new_path)),
+                "INSERT INTO AgLibraryFile (id_local, id_global, folder, idx_filename, "
+                "baseName, extension, lc_idx_filename, lc_idx_filenameExtension, "
+                "originalFilename, modTime, modTimeNS, legacyImage, fileSize) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (file_id, _new_uuid(), folder_id, new_name, stem,
+                 ext.lstrip("."), new_name.lower(), ext.lstrip(".").lower(),
+                 new_name, int(os.path.getmtime(new_path)), None, 0,
+                 os.path.getsize(new_path)),
             )
         conn.execute("UPDATE Adobe_images SET rootFile = ? WHERE id_local = ?",
                      (file_id, photo.image_id))

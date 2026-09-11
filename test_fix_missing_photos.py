@@ -40,6 +40,10 @@ CREATE TABLE AgLibraryFile (
     id_global TEXT,
     folder INTEGER,
     idx_filename TEXT,
+    baseName TEXT,
+    extension TEXT,
+    lc_idx_filename TEXT,
+    lc_idx_filenameExtension TEXT,
     originalFilename TEXT,
     modTime INTEGER,
     modTimeNS INTEGER,
@@ -80,9 +84,15 @@ def make_catalog(path: str, library_dir: str) -> None:
         (4, "IMG_0004.JPG", False, "2021-07-04T12:00:00",  4_000_000, "JPEG"),
     ]
     for fid, fname, exists, capture, size, fmt in files:
+        stem, ext = os.path.splitext(fname)
+        # Columns: id_local, id_global, folder, idx_filename, baseName,
+        # extension, lc_idx_filename, lc_idx_filenameExtension,
+        # originalFilename, modTime, modTimeNS, legacyImage, fileSize
         conn.execute(
-            "INSERT INTO AgLibraryFile VALUES (?, NULL, 1, ?, ?, ?, NULL, 0, ?)",
-            (fid, fname, int(now.timestamp()), None, size),
+            "INSERT INTO AgLibraryFile VALUES (?, NULL, 1, ?, ?, ?, ?, ?, ?, "
+            "?, NULL, 0, ?)",
+            (fid, fname, stem, ext.lstrip("."), fname.lower(),
+             ext.lstrip(".").lower(), fname, int(now.timestamp()), size),
         )
         conn.execute(
             "INSERT INTO Adobe_images VALUES (?, NULL, ?, ?, ?, 0, 0, NULL)",
@@ -296,7 +306,8 @@ def test_duplicate_filenames() -> int:
         for fid, folder_id, capture, size in photos:
             conn.execute(
                 "INSERT INTO AgLibraryFile VALUES (?, NULL, ?, 'DSCF0354.RAF', "
-                "'DSCF0354.RAF', ?, NULL, 0, ?)",
+                "'DSCF0354', 'RAF', 'dscf0354.raf', 'raf', 'DSCF0354.RAF', "
+                "?, NULL, 0, ?)",
                 (fid, folder_id, now, size),
             )
             conn.execute(
@@ -309,13 +320,12 @@ def test_duplicate_filenames() -> int:
         # Both files were moved into "recovered" — same names, different
         # dates, each carrying its real EXIF capture time.
         os.makedirs(recovered, exist_ok=True)
+        os.makedirs(os.path.join(recovered, "sub"), exist_ok=True)
         write_jpeg_with_exif(
             os.path.join(recovered, "DSCF0354.RAF"),
             dt.datetime(2024, 5, 10, 9, 15, 0), 31_111_111)
         write_jpeg_with_exif(
-            os.path.join(recovered, "sub", "DSCF0354.RAF")
-            if os.makedirs(os.path.join(recovered, "sub"), exist_ok=True) is None
-            else os.path.join(recovered, "sub", "DSCF0354.RAF"),
+            os.path.join(recovered, "sub", "DSCF0354.RAF"),
             dt.datetime(2024, 3, 28, 13, 39, 39), 32_539_456)
 
         # ---------------- dry run ----------------
@@ -344,8 +354,22 @@ def test_duplicate_filenames() -> int:
         march_folder = rows["2024-03-28T13:39:39"].replace("\\", "/").rstrip("/")
         may_folder = rows["2024-05-10T09:15:00"].replace("\\", "/").rstrip("/")
         assert march_folder.endswith("recovered/sub"), (rows, "March photo matched wrong file!")
-        assert not march_folder.endswith("recovered/sub/DSCF0354.RAF")
         assert may_folder.endswith("recovered") and not may_folder.endswith("recovered/sub"), (rows, "May photo matched wrong file!")
+
+        # The re-linked file rows must carry consistent name columns
+        # (baseName/extension/lc_idx_filename updated together with
+        # idx_filename — see update_catalog_file_location).
+        conn = sqlite3.connect(catalog)
+        name_rows = conn.execute(
+            "SELECT idx_filename, baseName, extension, lc_idx_filename "
+            "FROM AgLibraryFile"
+        ).fetchall()
+        conn.close()
+        for idx_name, base, ext, lc_name in name_rows:
+            stem, ext_raw = os.path.splitext(idx_name)
+            assert base == stem, (name_rows, "baseName not updated on rename")
+            assert ext == ext_raw.lstrip("."), (name_rows, "extension not updated on rename")
+            assert lc_name == idx_name.lower(), (name_rows, "lc_idx_filename not updated on rename")
         print("duplicate-name verification OK (no swap)")
         return 0
     finally:

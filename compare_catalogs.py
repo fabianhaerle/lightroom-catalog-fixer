@@ -52,8 +52,9 @@ def dump(title: str, path: str) -> dict:
     return data
 
 
-d2 = dump(*next(iter(CATS.items())))
-d3 = dump(list(CATS.items())[1][0], list(CATS.items())[1][1])
+(title2, path2), (title3, path3) = CATS.items()
+d2 = dump(title2, path2)
+d3 = dump(title3, path3)
 
 print()
 print("=" * 78)
