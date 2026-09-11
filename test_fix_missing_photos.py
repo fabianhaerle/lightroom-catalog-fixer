@@ -12,6 +12,7 @@ import datetime as dt
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,54 @@ def make_recovered(recovered_dir: str) -> None:
         fh.write(b"\0" * 4_000_000)
 
 
+# ---------------------------------------------------------------------------
+# Minimal real EXIF blob builders for the duplicate-name regression test.
+# ---------------------------------------------------------------------------
+
+def build_exif_bytes(capture: dt.datetime, little_endian: bool = True) -> bytes:
+    """Build a minimal TIFF/EXIF block containing DateTimeOriginal."""
+    order = b"II" if little_endian else b"MM"
+    fmt = "<" if little_endian else ">"
+    date_str = capture.strftime("%Y:%m:%d %H:%M:%S").encode("ascii") + b"\x00"
+
+    # Layout: header(8) | IFD0(2+2*12+4) | ExifIFD(2+2*12+4) | date bytes
+    ifd0_off = 8
+    exif_ifd_off = ifd0_off + 2 + 12 + 4
+    date_off = exif_ifd_off + 2 + 12 + 4
+    date_len = len(date_str)
+
+    out = bytearray()
+    out += order + b"\x2a\x00" if little_endian else order + b"\x00\x2a"
+    out += struct.pack(fmt + "I", ifd0_off)
+    # IFD0: one entry -> ExifIFD pointer
+    out += struct.pack(fmt + "H", 1)
+    out += struct.pack(fmt + "HHI", 0x8769, 4, 1) + struct.pack(fmt + "I", exif_ifd_off)
+    out += struct.pack(fmt + "I", 0)  # next IFD = none
+    # Exif IFD: one entry -> DateTimeOriginal (ASCII, count = date_len)
+    out += struct.pack(fmt + "H", 1)
+    out += struct.pack(fmt + "HHI", 0x9003, 2, date_len)
+    if date_len <= 4:
+        out += date_str.ljust(4, b"\x00")
+    else:
+        out += struct.pack(fmt + "I", date_off)
+    out += struct.pack(fmt + "I", 0)  # next IFD = none
+    assert len(out) == date_off, (len(out), date_off)
+    out += date_str
+    return bytes(out)
+
+
+def write_jpeg_with_exif(path: str, capture: dt.datetime, size: int) -> None:
+    """Write a minimal JPEG (SOI/APP0/APP1/EOI) with EXIF capture time."""
+    exif = build_exif_bytes(capture)
+    app1_payload = b"Exif\x00\x00" + exif
+    app1 = b"\xff\xe1" + struct.pack(">H", len(app1_payload) + 2) + app1_payload
+    data = b"\xff\xd8" + app1 + b"\xff\xdb" + b"\x00" * 64 + b"\xff\xd9"
+    # Pad to the requested size so file sizes differ between candidates.
+    data += b"\0" * max(0, size - len(data))
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
 def run(args, expect_rc=0):
     proc = subprocess.run(
         [sys.executable, SCRIPT] + args,
@@ -208,6 +257,101 @@ def main() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_duplicate_filenames() -> int:
+    """
+    Regression test: two catalog photos share the same file name but were
+    shot at different times (camera counter reset after empty battery) and
+    live in different folders. Both files were moved elsewhere.
+
+    The script must re-link each photo to the file with the MATCHING capture
+    time — never swap them.
+    """
+    tmp = tempfile.mkdtemp(prefix="lrcat-dup-")
+    try:
+        catalog = os.path.join(tmp, "dup.lrcat")
+        library = os.path.join(tmp, "library")
+        recovered = os.path.join(tmp, "recovered")
+        os.makedirs(library, exist_ok=True)
+
+        # Build the catalog: two photos named DSCF0354.RAF in different
+        # folders, captured 2 months apart.
+        conn = sqlite3.connect(catalog)
+        conn.executescript(SCHEMA)
+        conn.execute(
+            "INSERT INTO AgLibraryRootFolder VALUES (1, NULL, 'Library', ?, NULL)",
+            (library + os.sep,),
+        )
+        conn.execute(
+            "INSERT INTO AgLibraryFolder VALUES (1, NULL, '', 1, NULL)")
+        conn.execute(
+            "INSERT INTO AgLibraryFolder VALUES (2, NULL, '2024/03/', 1, NULL)")
+        conn.execute(
+            "INSERT INTO AgLibraryFolder VALUES (3, NULL, '2024/05/', 1, NULL)")
+        now = int(dt.datetime.now().timestamp())
+        # (file_id, folder_id, capture, size)
+        photos = [
+            (1, 2, "2024-03-28T13:39:39", 32_539_456),   # March shot
+            (2, 3, "2024-05-10T09:15:00", 31_111_111),   # May shot (same name!)
+        ]
+        for fid, folder_id, capture, size in photos:
+            conn.execute(
+                "INSERT INTO AgLibraryFile VALUES (?, NULL, ?, 'DSCF0354.RAF', "
+                "'DSCF0354.RAF', ?, NULL, 0, ?)",
+                (fid, folder_id, now, size),
+            )
+            conn.execute(
+                "INSERT INTO Adobe_images VALUES (?, NULL, ?, ?, 'RAW', 0, 0, NULL)",
+                (fid, fid, capture),
+            )
+        conn.commit()
+        conn.close()
+
+        # Both files were moved into "recovered" — same names, different
+        # dates, each carrying its real EXIF capture time.
+        os.makedirs(recovered, exist_ok=True)
+        write_jpeg_with_exif(
+            os.path.join(recovered, "DSCF0354.RAF"),
+            dt.datetime(2024, 5, 10, 9, 15, 0), 31_111_111)
+        write_jpeg_with_exif(
+            os.path.join(recovered, "sub", "DSCF0354.RAF")
+            if os.makedirs(os.path.join(recovered, "sub"), exist_ok=True) is None
+            else os.path.join(recovered, "sub", "DSCF0354.RAF"),
+            dt.datetime(2024, 3, 28, 13, 39, 39), 32_539_456)
+
+        # ---------------- dry run ----------------
+        out = run([catalog, recovered])
+        assert "2 photos are MISSING" in out, out
+        assert "CAN BE FIXED (2)" in out, out
+        assert "capture time identical" in out, out
+        assert "no changes were made" in out, out
+        print("--- duplicate-name dry run OK ---")
+        print(out)
+
+        # ---------------- apply ----------------
+        out = run([catalog, recovered, "--apply"])
+        assert "2 photo(s) re-linked" in out, out
+
+        # ---------------- verify: no swap ----------------
+        conn = sqlite3.connect(catalog)
+        rows = dict(conn.execute(
+            "SELECT i.captureTime, fo.pathFromRoot FROM Adobe_images i "
+            "JOIN AgLibraryFile f ON i.rootFile = f.id_local "
+            "JOIN AgLibraryFolder fo ON f.folder = fo.id_local"
+        ).fetchall())
+        conn.close()
+        # pathFromRoot is relative to the chosen root folder (here the volume
+        # root), so compare folder suffixes.
+        march_folder = rows["2024-03-28T13:39:39"].replace("\\", "/").rstrip("/")
+        may_folder = rows["2024-05-10T09:15:00"].replace("\\", "/").rstrip("/")
+        assert march_folder.endswith("recovered/sub"), (rows, "March photo matched wrong file!")
+        assert not march_folder.endswith("recovered/sub/DSCF0354.RAF")
+        assert may_folder.endswith("recovered") and not may_folder.endswith("recovered/sub"), (rows, "May photo matched wrong file!")
+        print("duplicate-name verification OK (no swap)")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_real_catalog() -> int:
     """Test against the real example catalog in example-data/ (on a copy)."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -269,6 +413,7 @@ def test_real_catalog() -> int:
 
 if __name__ == "__main__":
     rc = main()
+    rc = test_duplicate_filenames() or rc
     rc = test_real_catalog() or rc
     print("\nALL TESTS PASSED (including real catalog)")
     sys.exit(rc)

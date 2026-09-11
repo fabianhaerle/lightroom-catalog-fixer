@@ -37,9 +37,10 @@ import datetime as _dt
 import os
 import shutil
 import sqlite3
+import struct
 import sys
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,7 @@ class CatalogPhoto:
     color_labels: Optional[str]
     file_format: Optional[str]
     is_raw: bool
+    mod_time: Optional[float] = None   # AgLibraryFile.modTime (epoch seconds)
     # Filled in later:
     old_absolute_path: Optional[str] = None
     exists_on_disk: bool = False
@@ -127,7 +129,7 @@ class CandidateFile:
     # Metadata extracted from the file itself or its XMP sidecar:
     original_filename: Optional[str] = None   # from XMP: photoshop:OriginalDocumentName / xmpMM:DerivedFrom
     capture_time: Optional[_dt.datetime] = None
-    source: str = "scan"                      # "scan" | "xmp"
+    source: str = "scan"                      # "scan" | "xmp" | "exif"
     score: float = 0.0
     reasons: List[str] = field(default_factory=list)
 
@@ -173,7 +175,9 @@ def load_catalog_photos(conn: sqlite3.Connection) -> List[CatalogPhoto]:
             i.rating,
             i.pick,
             i.colorLabels,
-            i.fileFormat
+            i.fileFormat,
+            f.modTime,
+            f.importHash
         FROM Adobe_images i
         LEFT JOIN AgLibraryFile f   ON i.rootFile = f.id_local
         LEFT JOIN AgLibraryFolder fo ON f.folder = fo.id_local
@@ -181,11 +185,21 @@ def load_catalog_photos(conn: sqlite3.Connection) -> List[CatalogPhoto]:
         ORDER BY i.id_local
     """
     photos: List[CatalogPhoto] = []
-    for row in conn.execute(query):
+    try:
+        rows = conn.execute(query).fetchall()
+    except sqlite3.OperationalError:
+        # Older/simpler catalogs may lack importHash (or modTime); retry
+        # without the optional columns.
+        query = query.replace(",\n            f.importHash", "") \
+                     .replace(",\n            f.modTime", "")
+        rows = conn.execute(query).fetchall()
+    for row in rows:
+        # Pad rows from the fallback query so unpacking always works.
+        row = tuple(row) + (None,) * (14 - len(row))
         (image_id, file_id, folder_id, root_folder_id,
          filename, folder_path, root_path,
          capture_time, rating, pick, color_labels,
-         file_format) = row
+         file_format, mod_time, import_hash) = row
 
         filename = filename or ""
         ext = os.path.splitext(filename)[1].lower()
@@ -198,14 +212,34 @@ def load_catalog_photos(conn: sqlite3.Connection) -> List[CatalogPhoto]:
             folder_path=folder_path or "",
             root_path=root_path or "",
             capture_time=parse_lr_datetime(capture_time),
-            file_size=None,
+            file_size=parse_import_hash_size(import_hash),
             rating=rating,
             pick=pick,
             color_labels=color_labels,
             file_format=file_format,
             is_raw=ext in RAW_EXTENSIONS,
+            mod_time=mod_time,
         ))
     return photos
+
+
+def parse_import_hash_size(import_hash: Optional[str]) -> Optional[int]:
+    """
+    Extract the file size from an AgLibraryFile.importHash value.
+
+    Lightroom stores it as ``"<modTime>:<filename>:<fileSize>"``, e.g.
+    ``"733325979:DSCF0354.RAF:32539456"``. Returns ``None`` if the hash is
+    missing or malformed.
+    """
+    if not import_hash:
+        return None
+    parts = import_hash.split(":")
+    if len(parts) >= 3:
+        try:
+            return int(parts[-1])
+        except ValueError:
+            return None
+    return None
 
 
 def parse_lr_datetime(value: Optional[str]) -> Optional[_dt.datetime]:
@@ -327,6 +361,117 @@ def read_xmp_sidecar(xmp_path: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Embedded EXIF parsing (capture time without XMP sidecar)
+# ---------------------------------------------------------------------------
+
+# EXIF tag for "DateTimeOriginal" (when the picture was taken) and
+# "DateTimeDigitized". Both are ASCII strings formatted "YYYY:MM:DD HH:MM:SS".
+EXIF_TAG_DATETIME_ORIGINAL = 0x9003
+EXIF_TAG_DATETIME_DIGITIZED = 0x9004
+EXIF_TAG_DATETIME = 0x0132
+
+# How many bytes at the start of a file we inspect for an EXIF/TIFF header.
+_EXIF_PROBE_BYTES = 4 * 1024 * 1024
+
+
+def _parse_exif_ascii_date(value: Optional[bytes]) -> Optional[_dt.datetime]:
+    """Parse an EXIF ASCII date ('YYYY:MM:DD HH:MM:SS')."""
+    if not value:
+        return None
+    text = value.split(b"\x00")[0].decode("ascii", errors="replace").strip()
+    try:
+        return _dt.datetime.strptime(text, "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _read_exif_ifd(data: bytes, tiff_start: int, ifd_offset: int,
+                   byte_order: str) -> Dict[int, object]:
+    """
+    Read one IFD and return {tag: value}.
+
+    ASCII entries are returned as raw ``bytes``; SHORT/LONG entries are
+    returned as ``int`` (needed for the Exif sub-IFD pointer, tag 0x8769).
+    """
+    entries: Dict[int, object] = {}
+    try:
+        count = struct.unpack_from(byte_order + "H", data, tiff_start + ifd_offset)[0]
+    except struct.error:
+        return entries
+    base = tiff_start + ifd_offset + 2
+    for k in range(min(count, 512)):  # sanity cap
+        entry = base + k * 12
+        try:
+            tag, typ, num = struct.unpack_from(byte_order + "HHI", data, entry)
+        except struct.error:
+            break
+        if typ == 2:  # ASCII
+            if num <= 4:
+                raw = data[entry + 8:entry + 8 + num]
+            else:
+                (val_off,) = struct.unpack_from(byte_order + "I", data, entry + 8)
+                raw = data[tiff_start + val_off:tiff_start + val_off + num]
+            entries[tag] = raw
+        elif typ == 3 and num == 1:  # SHORT
+            (val,) = struct.unpack_from(byte_order + "H", data, entry + 8)
+            entries[tag] = val
+        elif typ == 4 and num == 1:  # LONG
+            (val,) = struct.unpack_from(byte_order + "I", data, entry + 8)
+            entries[tag] = val
+    return entries
+
+
+def extract_exif_capture_time(path: str) -> Optional[_dt.datetime]:
+    """
+    Read the capture date/time embedded in a file's EXIF metadata.
+
+    Works for JPEG/TIFF-style files (TIFF header at offset 0) and for raw
+    formats that embed a TIFF header (CR2, NEF, ARW, RAF, ORF, DNG, ...).
+    Returns a naive local datetime or ``None`` if no date could be found.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_EXIF_PROBE_BYTES)
+    except OSError:
+        return None
+
+    # Locate the TIFF header ("II*\0" little-endian or "MM\0*" big-endian).
+    tiff_start = -1
+    byte_order = ""
+    for marker, order in ((b"II*\x00", "<"), (b"MM\x00\x2a", ">")):
+        idx = data.find(marker)
+        if idx >= 0:
+            tiff_start, byte_order = idx, order
+            break
+    if tiff_start < 0:
+        return None
+
+    try:
+        (ifd0_offset,) = struct.unpack_from(byte_order + "I", data, tiff_start + 4)
+        ifd0 = _read_exif_ifd(data, tiff_start, ifd0_offset, byte_order)
+    except struct.error:
+        return None
+
+    # Preferred: DateTimeOriginal from the Exif sub-IFD.
+    exif_ptr = ifd0.get(0x8769)
+    if isinstance(exif_ptr, int):
+        try:
+            exif_ifd = _read_exif_ifd(data, tiff_start, exif_ptr, byte_order)
+        except struct.error:
+            exif_ifd = {}
+        for tag in (EXIF_TAG_DATETIME_ORIGINAL, EXIF_TAG_DATETIME_DIGITIZED):
+            parsed = _parse_exif_ascii_date(exif_ifd.get(tag))
+            if parsed is not None:
+                return parsed
+
+    # Fallbacks: IFD0 DateTime, then the Exif sub-IFD digitized date.
+    parsed = _parse_exif_ascii_date(ifd0.get(EXIF_TAG_DATETIME))
+    if parsed is not None:
+        return parsed
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Disk scanning
 # ---------------------------------------------------------------------------
 
@@ -376,6 +521,18 @@ class DiskIndex:
                     if read_sidecars and ext in RAW_EXTENSIONS:
                         self._read_sidecar(cand)
 
+                    # Capture time from embedded EXIF (works for JPEGs and
+                    # most raw formats even without an XMP sidecar). This is
+                    # essential to tell apart files that share the same name
+                    # (e.g. after a camera counter reset).
+                    if cand.capture_time is None:
+                        cand.capture_time = extract_exif_capture_time(full)
+                        if cand.capture_time is not None:
+                            cand.capture_time = cand.capture_time.replace(microsecond=0)
+                            cand.source = "exif"
+                            self.by_capture_time.setdefault(
+                                cand.capture_time, []).append(cand)
+
     def _read_sidecar(self, cand: CandidateFile) -> None:
         base, _ = os.path.splitext(cand.path)
         xmp_path = base + ".xmp"
@@ -394,6 +551,7 @@ class DiskIndex:
             parsed = parse_xmp_datetime(meta["capture_time"])
             if parsed is not None:
                 cand.capture_time = parsed.replace(microsecond=0)
+                cand.source = "xmp"
                 self.by_capture_time.setdefault(cand.capture_time, []).append(cand)
 
     def find_by_name(self, filename: str) -> List[CandidateFile]:
@@ -425,6 +583,12 @@ def score_candidate(photo: CatalogPhoto, cand: CandidateFile) -> Tuple[float, Li
     Score how well a candidate file matches a missing catalog photo.
 
     Higher is better. Returns (score, reasons).
+
+    Capture time is the strongest identity signal: two photos can share the
+    same file name (camera counters reset when the battery is emptied), but
+    they were never taken at the same moment. A candidate whose capture time
+    contradicts the catalog is therefore rejected outright, while a matching
+    capture time earns a large bonus.
     """
     score = 0.0
     reasons: List[str] = []
@@ -433,6 +597,19 @@ def score_candidate(photo: CatalogPhoto, cand: CandidateFile) -> Tuple[float, Li
     cand_ext = os.path.splitext(cand.path)[1].lower()
     photo_base = photo.base_name.lower()
     photo_ext = photo.extension
+
+    # --- 0. capture time conflict check (hard veto) --------------------------
+    # If BOTH sides know their capture time and they differ by more than a
+    # day, this cannot be the same photo — even if the file name matches
+    # exactly. This prevents confusion between same-named files from
+    # different shooting sessions (reset camera counters).
+    ref_time = photo.capture_time
+    cand_time = cand.capture_time
+    time_delta: Optional[float] = None
+    if ref_time and cand_time:
+        time_delta = abs((ref_time.replace(microsecond=0) - cand_time).total_seconds())
+        if time_delta > 86400:
+            return -1000.0, ["capture time differs by more than a day (rejected)"]
 
     # --- 1. exact file name -------------------------------------------------
     if cand_base == photo_base:
@@ -450,28 +627,22 @@ def score_candidate(photo: CatalogPhoto, cand: CandidateFile) -> Tuple[float, Li
         reasons.append("XMP sidecar records original file name")
 
     # --- 3. capture time ----------------------------------------------------
-    ref_time = photo.capture_time
-    cand_time = cand.capture_time
-    if ref_time and cand_time:
-        delta = abs((ref_time - cand_time).total_seconds())
-        if delta == 0:
+    if time_delta is not None:
+        if time_delta == 0:
             score += 50.0
             reasons.append("capture time identical")
-        elif delta <= 1:
+        elif time_delta <= 1:
             score += 45.0
             reasons.append("capture time within 1 second")
-        elif delta <= 60:
+        elif time_delta <= 60:
             score += 30.0
             reasons.append("capture time within 1 minute")
-        elif delta <= 3600:
+        elif time_delta <= 3600:
             score += 15.0
             reasons.append("capture time within 1 hour")
-        elif delta <= 86400:
+        elif time_delta <= 86400:
             score += 5.0
             reasons.append("capture time within 1 day")
-        else:
-            score -= 20.0
-            reasons.append("capture time differs by more than a day")
 
     # --- 4. file size -------------------------------------------------------
     if photo.file_size and cand.size:
@@ -518,12 +689,27 @@ def find_candidates(photo: CatalogPhoto, index: DiskIndex) -> List[CandidateFile
     scored: List[CandidateFile] = []
     for cand in seen.values():
         score, reasons = score_candidate(photo, cand)
-        cand.score = score
-        cand.reasons = reasons
         if score > 0:
-            scored.append(cand)
+            # Copy the candidate: index entries are shared between photos, so
+            # per-photo scores/reasons must not leak into other photos'
+            # reports (the last photo scored would otherwise win).
+            scored.append(replace(cand, score=score, reasons=reasons))
 
     scored.sort(key=lambda c: c.score, reverse=True)
+
+    # Tie-break equal scores deterministically: prefer the candidate whose
+    # capture time is closest to the photo's, then the one with the closest
+    # file size. This matters when several files share the same name (reset
+    # camera counters) and none of them carries readable metadata.
+    if photo.capture_time is not None:
+        ref = photo.capture_time.replace(microsecond=0)
+        scored.sort(key=lambda c: (
+            -c.score,
+            abs((c.capture_time - ref).total_seconds())
+            if c.capture_time is not None else float("inf"),
+            abs(c.size - photo.file_size) if photo.file_size else 0,
+            c.path,
+        ))
     return scored
 
 
@@ -841,11 +1027,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         photo.candidates = candidates
         best = candidates[0] if candidates else None
         if best and best.score >= args.min_score:
-            status = "fixed"
-            photo.best_candidate = best
-            results.append(MatchResult(photo=photo, status="fixed",
-                                       candidate=best,
-                                       message="; ".join(best.reasons)))
+            # Guard against same-name confusion: if another candidate scores
+            # exactly as high, the match is not unique. Without readable
+            # metadata (capture time / size) we cannot tell same-named files
+            # apart (e.g. after a camera counter reset), so refuse to guess.
+            runner_up = candidates[1] if len(candidates) > 1 else None
+            if runner_up is not None and runner_up.score == best.score:
+                status = "ambiguous"
+                results.append(MatchResult(
+                    photo=photo, status="ambiguous", candidate=best,
+                    message="several equally good candidates — refusing to "
+                            "guess; check capture times manually"))
+            else:
+                status = "fixed"
+                photo.best_candidate = best
+                results.append(MatchResult(photo=photo, status="fixed",
+                                           candidate=best,
+                                           message="; ".join(best.reasons)))
         elif candidates:
             status = "ambiguous"
             results.append(MatchResult(photo=photo, status="ambiguous",

@@ -295,7 +295,7 @@ Timezone suffixes (`Z`, `+01:00`) are stripped before comparison.
 | Capture time within 1 minute | +30 |
 | Capture time within 1 hour | +15 |
 | Capture time within 1 day | +5 |
-| Capture time differs by more than a day | **−20** |
+| Capture time differs by more than a day | **rejected (−1000)** |
 | File size identical | +20 |
 | File size differs by more than 50 % | −10 |
 | Raw↔raw or non-raw↔non-raw | +5 |
@@ -304,6 +304,28 @@ The default `--min-score 60` means a fix is proposed when there is at least
 an exact-name match, or a base-name match plus a close capture-time match.
 Raise it (e.g. `--min-score 100`) for stricter matching; lower it if you
 want more aggressive proposals (they will be listed as *ambiguous* first).
+
+### Same file name, different dates (reset camera counters)
+
+Cameras that reset their file counter after an empty battery produce
+**multiple photos with the same file name** — e.g. two `DSCF0354.RAF` files
+shot months apart in different folders. The script never confuses them:
+
+1. **Capture time is read from the files themselves.** Besides XMP sidecars,
+   the embedded EXIF (`DateTimeOriginal`) of JPEGs and raw files (CR2, NEF,
+   ARW, RAF, ORF, DNG, …) is parsed directly — no sidecar required.
+2. **Hard veto.** If a candidate's capture time differs from the catalog's
+   by more than a day, it is rejected outright, even if the file name
+   matches exactly.
+3. **Tie-breaking.** Equal scores are resolved by capture-time distance,
+   then file-size distance.
+4. **Refuses to guess.** If two candidates still score identically (no
+   readable metadata at all), the photo is reported as *ambiguous* instead
+   of being re-linked to a possibly wrong file.
+
+A regression test (`test_duplicate_filenames`) covers exactly this case:
+two catalog photos named `DSCF0354.RAF` from March and May, both moved —
+each is re-linked to the file with the matching capture time, never swapped.
 
 ---
 
@@ -333,7 +355,7 @@ want more aggressive proposals (they will be listed as *ambiguous* first).
 python test_fix_missing_photos.py
 ```
 
-The test suite has two parts:
+The test suite has three parts:
 
 1. **Synthetic end-to-end test** — builds a minimal catalog from scratch,
    creates a "library" with one existing and three missing photos, and a
@@ -341,7 +363,12 @@ The test suite has two parts:
    raw with XMP sidecar (found via `OriginalDocumentName`), and a renamed
    file with no sidecar (correctly reported unfixable). Verifies dry run
    makes no changes and `--apply` writes the expected rows.
-2. **Real-catalog test** — copies `example-data/` (a real Lightroom Classic
+2. **Duplicate-name test** — two catalog photos share the file name
+   `DSCF0354.RAF` but were shot months apart (reset camera counter). Both
+   files were moved; each carries its real EXIF capture time. Verifies each
+   photo is re-linked to the file with the *matching* capture time — never
+   swapped.
+3. **Real-catalog test** — copies `example-data/` (a real Lightroom Classic
    catalog with two deliberately moved pictures), runs the full
    dry-run → apply → verify cycle on the copy, and asserts the original was
    never modified.
@@ -361,9 +388,12 @@ debugging.
   catalog was copied to a new path, the old root folders remain and show as
   stale in Lightroom's folder panel; use Lightroom's "Update Folder
   Location" on the stale root to clean up.
-- **No EXIF extraction from image files.** Capture time comes from the
-  catalog and from XMP sidecars only. Files renamed *without* a sidecar can
-  only be matched by name/size signals.
+- **EXIF extraction covers common formats.** Capture time is read from
+  embedded EXIF (JPEG/TIFF and raw formats that embed a TIFF header: CR2,
+  NEF, ARW, RAF, ORF, DNG, …) and from XMP sidecars. Exotic raw variants
+  without a TIFF header fall back to name/size signals; same-named files
+  without any readable metadata are reported as ambiguous rather than
+  guessed.
 - **Video files, panoramas, HDR stacks** are not specifically handled;
   they are matched like any other file if their extension is known.
 - **Lightroom version compatibility** was verified against a current
