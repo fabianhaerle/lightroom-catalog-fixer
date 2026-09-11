@@ -831,6 +831,13 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
         if rel_from_root == ".":
             rel_from_root = ""
 
+    # Lightroom expects pathFromRoot to end with "/" (e.g. "2024/03/") so
+    # that absolutePath + pathFromRoot + idx_filename yields a valid path.
+    # Without the trailing slash the folder name concatenates directly with
+    # the file name (e.g. "01" + "IMG_4705.CR2" = "01IMG_4705.CR2").
+    if rel_from_root and not rel_from_root.endswith("/"):
+        rel_from_root += "/"
+
     # --- resolve / create folder row ----------------------------------------
     folder_row = conn.execute(
         "SELECT id_local FROM AgLibraryFolder WHERE rootFolder = ? AND pathFromRoot = ?",

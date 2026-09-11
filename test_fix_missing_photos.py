@@ -247,7 +247,7 @@ def main() -> int:
             "WHERE f.idx_filename = 'IMG_0002.CR2'"
         ).fetchone()
         assert row is not None, "IMG_0002.CR2 row lost"
-        assert row[0].replace("\\", "/").endswith("2021/May"), row
+        assert row[0].replace("\\", "/").rstrip("/").endswith("2021/May"), row
         # IMG_0003 must be re-linked to DSC_9876.NEF
         row = conn.execute(
             "SELECT f.idx_filename FROM Adobe_images i "
@@ -417,8 +417,8 @@ def test_real_catalog() -> int:
         conn.close()
         assert rows["DSCF0354.RAF"].replace("\\", "/") == "2024/03/", rows
         assert rows["IMG_6313.JPEG"].replace("\\", "/") == "2024/03/", rows
-        assert rows["DSCF0355.RAF"].replace("\\", "/") == "moved-images", rows
-        assert rows["IMG_6302.JPEG"].replace("\\", "/") == "moved-images", rows
+        assert rows["DSCF0355.RAF"].replace("\\", "/") == "moved-images/", rows
+        assert rows["IMG_6302.JPEG"].replace("\\", "/") == "moved-images/", rows
 
         # original catalog untouched
         conn = sqlite3.connect(
