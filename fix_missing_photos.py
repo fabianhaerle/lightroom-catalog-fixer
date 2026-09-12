@@ -629,7 +629,19 @@ def score_candidate(photo: CatalogPhoto, cand: CandidateFile) -> Tuple[float, Li
     photo_base = photo.base_name.lower()
     photo_ext = photo.extension
 
-    # --- 0. capture time conflict check (hard veto) --------------------------
+    # --- 0a. cross-format veto (hard veto) -----------------------------------
+    # A RAW file (e.g. .CR2) and a non-RAW file (e.g. .JPG) are never the
+    # same file, even if they share the same base name and capture time
+    # (cameras can shoot RAW+JPG pairs simultaneously). Reject outright so
+    # we never re-link a JPG catalog entry to a CR2 file or vice versa.
+    cand_is_raw = cand_ext in RAW_EXTENSIONS
+    if photo.is_raw != cand_is_raw:
+        return -1000.0, [
+            f"cross-format mismatch: catalog is {'RAW' if photo.is_raw else 'non-RAW'} "
+            f"but candidate is {cand_ext} (rejected)"
+        ]
+
+    # --- 0b. capture time conflict check (hard veto) -------------------------
     # If BOTH sides know their capture time and they differ by more than a
     # day, this cannot be the same photo — even if the file name matches
     # exactly. This prevents confusion between same-named files from
