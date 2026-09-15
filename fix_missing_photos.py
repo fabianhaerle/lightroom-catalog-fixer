@@ -262,11 +262,13 @@ def compute_absolute_path(photo: CatalogPhoto) -> Optional[str]:
     """Reconstruct the absolute path of a photo from catalog fields."""
     if not photo.root_path or not photo.filename:
         return None
-    parts = [photo.root_path]
+    root = photo.root_path.replace("\\", "/")
+    leading = "/" if root.startswith("/") else ""
+    parts = [root.strip("/")]
     if photo.folder_path:
         parts.append(photo.folder_path.replace("\\", "/").strip("/"))
     parts.append(photo.filename)
-    joined = "/".join(p.strip("/") for p in parts if p)
+    joined = leading + "/".join(p.strip("/") for p in parts if p)
     # Normalise to the platform's separators
     return os.path.normpath(joined.replace("/", os.sep))
 
@@ -829,7 +831,7 @@ def update_catalog_file_location(conn: sqlite3.Connection, photo: CatalogPhoto,
         # No existing root folder matches: create one at the volume root
         # (Lightroom convention: root folders represent volumes/drives).
         drive, _ = os.path.splitdrive(new_dir)
-        root_prefix = (drive + os.sep) if drive else new_dir
+        root_prefix = (drive + os.sep) if drive else os.sep
         max_id = conn.execute(
             "SELECT COALESCE(MAX(id_local), 0) FROM AgLibraryRootFolder"
         ).fetchone()[0]
